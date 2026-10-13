@@ -21,7 +21,7 @@ app = FastAPI(title="Semantic Cache Proxy")
 
 # --- Cache setup ---
 model = SentenceTransformer("all-MiniLM-L6-v2")
-THRESHOLD = 0.85
+THRESHOLD = float(os.getenv("THRESHOLD", "0.85"))
 TTL_SECONDS = 24 * 60 * 60          # entries expire after 24 hours
 DATA_DIR = "cache_data"
 INDEX_FILE = os.path.join(DATA_DIR, "index.faiss")
