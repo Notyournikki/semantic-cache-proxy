@@ -1,5 +1,7 @@
 import os
 import time
+import json
+import threading
 import numpy as np
 import faiss
 from dotenv import load_dotenv
@@ -19,9 +21,50 @@ app = FastAPI(title="Semantic Cache Proxy")
 
 # --- Cache setup ---
 model = SentenceTransformer("all-MiniLM-L6-v2")
-index = faiss.IndexFlatIP(384)
-store = []          # each entry: {"query", "answer", "tokens"}
 THRESHOLD = 0.85
+TTL_SECONDS = 24 * 60 * 60          # entries expire after 24 hours
+DATA_DIR = "cache_data"
+INDEX_FILE = os.path.join(DATA_DIR, "index.faiss")
+STORE_FILE = os.path.join(DATA_DIR, "store.json")
+os.makedirs(DATA_DIR, exist_ok=True)
+lock = threading.Lock()             # prevents two requests editing the cache at once
+
+index = faiss.IndexFlatIP(384)
+store = []          # each entry: {"query", "answer", "tokens", "ts"}
+
+
+def save_cache():
+    faiss.write_index(index, INDEX_FILE)
+    with open(STORE_FILE, "w", encoding="utf-8") as f:
+        json.dump(store, f)
+
+
+def load_cache():
+    global index, store
+    if os.path.exists(INDEX_FILE) and os.path.exists(STORE_FILE):
+        index = faiss.read_index(INDEX_FILE)
+        with open(STORE_FILE, "r", encoding="utf-8") as f:
+            store = json.load(f)
+        print(f"Loaded {len(store)} cache entries from disk")
+
+
+def remove_expired():
+    """Rebuild the index without entries older than the TTL."""
+    global index, store
+    now = time.time()
+    keep = [i for i, s in enumerate(store) if now - s["ts"] < TTL_SECONDS]
+    if len(keep) == len(store):
+        return
+    new_index = faiss.IndexFlatIP(384)
+    new_store = []
+    for i in keep:
+        new_index.add(index.reconstruct(i).reshape(1, -1))
+        new_store.append(store[i])
+    index, store = new_index, new_store
+    save_cache()
+
+
+load_cache()
 
 # --- Stats setup ---
 hit_latencies = []
@@ -74,30 +117,45 @@ def chat(request: ChatRequest):
         vec = embed(request.query)
 
         # 1. Look for a similar question in the cache
-        if index.ntotal > 0:
-            scores, ids = index.search(vec, 1)
-            best_score = float(scores[0][0])
-            if best_score >= THRESHOLD:
-                hit = store[int(ids[0][0])]
-                latency = round((time.time() - start) * 1000, 1)
+        found = None
+        with lock:
+            remove_expired()
+            if index.ntotal > 0:
+                scores, ids = index.search(vec, 1)
+                best_score = float(scores[0][0])
+                if best_score >= THRESHOLD:
+                    found = (store[int(ids[0][0])], best_score)
 
-                hit_latencies.append(latency)
-                tokens_saved += hit["tokens"]
-                log_recent(request.query, "HIT", round(best_score, 3), latency)
+        if found:
+            hit, best_score = found
+            latency = round((time.time() - start) * 1000, 1)
 
-                return {
-                    "query": request.query,
-                    "matched_query": hit["query"],
-                    "answer": hit["answer"],
-                    "cache": "HIT",
-                    "similarity": round(best_score, 3),
-                    "latency_ms": latency,
-                }
+            hit_latencies.append(latency)
+            tokens_saved += hit["tokens"]
+            log_recent(request.query, "HIT", round(best_score, 3), latency)
+
+            return {
+                "query": request.query,
+                "matched_query": hit["query"],
+                "answer": hit["answer"],
+                "cache": "HIT",
+                "similarity": round(best_score, 3),
+                "latency_ms": latency,
+            }
 
         # 2. Cache miss: ask the LLM, then remember the result
         answer, tokens = call_llm(request.query)
-        index.add(vec)
-        store.append({"query": request.query, "answer": answer, "tokens": tokens})
+        
+        with lock:
+            index.add(vec)
+            store.append({
+                "query": request.query, 
+                "answer": answer, 
+                "tokens": tokens, 
+                "ts": time.time()
+            })
+            save_cache()
+
         latency = round((time.time() - start) * 1000, 1)
 
         miss_latencies.append(latency)
@@ -145,8 +203,10 @@ def view_cache():
 @app.post("/reset")
 def reset_cache():
     global tokens_saved
-    index.reset()
-    store.clear()
+    with lock:
+        index.reset()
+        store.clear()
+        save_cache()
     hit_latencies.clear()
     miss_latencies.clear()
     recent.clear()
